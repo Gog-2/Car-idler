@@ -1,0 +1,4 @@
+repository "AssetTest/Car idler@10170967489904@cloud"
+  path "/"
+    br "/main"
+    co "/main"
