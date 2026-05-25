@@ -8,6 +8,7 @@ public class GameController : MonoBehaviour
 {
     [Header("UI")]
     public TMP_Text moneyText;
+    public TMP_Text lapsText;
     public FloatingTextPool floatingTextPool;
     public NotificationPool notificationPool;
     
@@ -21,6 +22,7 @@ public class GameController : MonoBehaviour
     public int carsPerTier = 10;
 
     [Header("Economy")]
+    public int totalLaps;
     public double totalMoney;
     
     private float incomeMultiplier = 1f;
@@ -39,22 +41,76 @@ public class GameController : MonoBehaviour
 
     void Start() {
         _cts = new CancellationTokenSource();
+        UpdateLaps(0);
         StartEconomyLoop(_cts.Token).Forget();
         
-        
+        // Запускаем корутины для каждой локации
         foreach (var loc in locations) {
+            loc.UpdateLocalCurrencyUI(totalMoney, totalLaps);
             loc.UpdateCooldown();
-            loc.nextSpawnTime = Time.time + loc.currentCooldown;
+            StartLootBoxSpawnLoop(loc, _cts.Token).Forget();
         }
 
         BuyCar();
+        // Инициализация UI закрытых локаций
+        for (int i = 0; i < locations.Length; i++) {
+            var loc = locations[i];
+            if (loc.unlockCostText != null)
+                loc.unlockCostText.text = $"{loc.unlockLapCost} 🔄";
+    
+            if (!loc.isUnlocked) {
+                if (loc.unlockButton != null) loc.unlockButton.SetActive(true);
+                if (loc.lockedOverlay != null) loc.lockedOverlay.SetActive(true);
+            } else {
+                ApplyUnlockVisuals(i);
+            }
+        }
     }
+
+    private async UniTaskVoid StartLootBoxSpawnLoop(LocationData loc, CancellationToken token) {
+        float timeUntilSpawn = loc.currentCooldown;
+        
+        while (!token.IsCancellationRequested) {
+            if (!loc.isUnlocked) {
+                if (loc.lootBoxTimerText != null) loc.lootBoxTimerText.text = "";
+                await UniTask.Delay(500, cancellationToken: token);
+                continue;
+            }
+            while (timeUntilSpawn > 0 && !token.IsCancellationRequested) {
+                await UniTask.Delay(100, cancellationToken: token);
+                timeUntilSpawn -= 0.1f;
+                loc.lootBoxTimerText.text = $"Лут бокс: {timeUntilSpawn:F1}с";
+            }
+            SpawnLootBox(loc);
+            loc.lootBoxTimerText.text = "Лут бокс: Появился!";
+            await UniTask.Delay(1000, cancellationToken: token);
+            
+            timeUntilSpawn = loc.currentCooldown;
+        }
+    }
+    private void UpdateLaps(int amount) {
+        totalLaps += amount;
+        if (lapsText != null)
+            lapsText.text = $"Кругов: {totalLaps}";
+        
+        foreach (var loc in locations) {
+            loc.UpdateLocalCurrencyUI(totalMoney, totalLaps);
+        }
+    }
+
+    public void AddLaps(int amount) {
+        UpdateLaps(amount);
+    }
+    
     private void UpdateMoney(double amount) {
         totalMoney += amount;
         if (moneyText != null)
             moneyText.text = $"{totalMoney:F0}$";
         if (floatingTextPool != null && amount > 0)
             floatingTextPool.Show($"+{amount:F0}$");
+        foreach (var loc in locations) {
+            loc.UpdateLocalCurrencyUI(totalMoney, totalLaps);
+        }
     }
 
     public void AddMoney(double amount) {
@@ -68,6 +124,10 @@ public class GameController : MonoBehaviour
     public void BuyCarAtLocation(int locIndex) {
         LocationData currentLoc = locations[locIndex];
 
+        if (!currentLoc.isUnlocked) {
+            Debug.Log("Локация закрыта!");
+            return;
+        }
         if (currentLoc.IsFull) {
             Debug.Log("Локация заполнена! Максимум 30 машин.");
             return;
@@ -80,7 +140,6 @@ public class GameController : MonoBehaviour
         }
 
         totalMoney -= cost;
-        
         
         int tierIndex = Mathf.Min(currentLoc.carsInLocation.Count / carsPerTier, tiers.Length - 1);
         TierConfig config = tiers[tierIndex];
@@ -110,14 +169,6 @@ public class GameController : MonoBehaviour
         Debug.Log($"Машина куплена на {currentLoc.locationName} за {cost}$");
     }
 
-    void HandleLootBoxSpawning() {
-        foreach (var loc in locations) {
-            if (Time.time > loc.nextSpawnTime) {
-                SpawnLootBox(loc);
-                loc.nextSpawnTime = Time.time + loc.currentCooldown;
-            }
-        }
-    }
     public void RefreshUpgradeUI(int locIndex) {
         var loc = locations[locIndex];
         double speedCost = 100 * Mathf.Pow(1.5f, loc.speedLevel);
@@ -129,7 +180,7 @@ public class GameController : MonoBehaviour
     void SpawnLootBox(LocationData loc) {
         if (loc.lootBoxPrefab == null || loc.path == null || loc.path.PointsCount < 2) return;
 
-        // Выбираем случайный сегмент пути (например, между 3 и 4 точкой)
+        // Выбираем случайный сегмент пути
         int segmentIndex = Random.Range(0, loc.path.PointsCount - 1);
         Vector3 p1 = loc.path.GetPoint(segmentIndex);
         Vector3 p2 = loc.path.GetPoint(segmentIndex + 1);
@@ -148,8 +199,8 @@ public class GameController : MonoBehaviour
         int bonusType = Random.Range(0, 3);
         switch (bonusType) {
             case 0:
-                totalMoney += totalMoney * 0.1;
-                totalMoney = System.Math.Round(totalMoney, 2);
+                double bonus = totalMoney * 0.1;
+                AddMoney(bonus);
                 notificationPool.Show("+10% Баланс!", Color.green, 3f);
                 break;
             case 1: // 2x income
@@ -184,44 +235,62 @@ public class GameController : MonoBehaviour
     }
     
     public void UpgradeSpeed(int locIndex) {
-        double cost = 100 * Mathf.Pow(1.5f, locations[locIndex].speedLevel);
-        RefreshUpgradeUI(locIndex);
+        var loc = locations[locIndex];
+    
+        if (loc.speedLevel >= LocationData.MAX_UPGRADE_LEVEL) {
+            Debug.Log("Скорость уже максимальна!");
+            return;
+        }
+    
+        double cost = 100 * Mathf.Pow(1.5f, loc.speedLevel);
         if (totalMoney >= cost) {
             totalMoney -= cost;
-            locations[locIndex].speedLevel++;
-            locations[locIndex].speedMultiplier += 0.1f;
-            Debug.Log($"Скорость на {locations[locIndex].locationName} улучшена!");
+            loc.speedLevel++;
+            Debug.Log($"Скорость на {loc.locationName} улучшена до уровня {loc.speedLevel}!");
+            RefreshUpgradeUI(locIndex);
+        } else {
+            Debug.Log($"Недостаточно денег! Нужно {cost}$");
         }
     }
 
     public void UpgradeLootBoxCooldown(int locIndex) {
-        RefreshUpgradeUI(locIndex);
-        double cost = 200 * Mathf.Pow(1.8f, locations[locIndex].cooldownLevel);
+        var loc = locations[locIndex];
+    
+        if (loc.cooldownLevel >= LocationData.MAX_UPGRADE_LEVEL) {
+            Debug.Log("Кулдаун уже минимален!");
+            return;
+        }
+    
+        double cost = 200 * Mathf.Pow(1.8f, loc.cooldownLevel);
         if (totalMoney >= cost) {
             totalMoney -= cost;
-            locations[locIndex].cooldownLevel++;
-            locations[locIndex].UpdateCooldown();
-            Debug.Log($"Кулдаун лутбокса на {locations[locIndex].locationName} уменьшен!");
+            loc.cooldownLevel++;
+            loc.UpdateCooldown();
+            Debug.Log($"Кулдаун лутбокса на {loc.locationName} уменьшен до уровня {loc.cooldownLevel}!");
+            RefreshUpgradeUI(locIndex);
+        } else {
+            Debug.Log($"Недостаточно денег! Нужно {cost}$");
         }
     }
 
     void FixedUpdate() {
-        HandleLootBoxSpawning();
         foreach (var loc in locations) {
-            float localMultiplier = loc.speedMultiplier * speedBoostMultiplier;
+            if (!loc.isUnlocked) continue; // пропускаем закрытые
+        
+            float localMultiplier = loc.SpeedMultiplier * speedBoostMultiplier;
 
             for (int i = 0; i < loc.carsInLocation.Count; i++) {
                 var car = loc.carsInLocation[i];
                 Vector3 target = loc.path.GetPoint(car.currentWaypointIndex);
-                
-                float finalSpeed = tiers[car.tierIndex].speed * localMultiplier;
             
+                float finalSpeed = tiers[car.tierIndex].speed * localMultiplier;
+        
                 car.transform.position = Vector3.MoveTowards(
                     car.transform.position, 
                     target, 
                     finalSpeed * Time.deltaTime
                 );
-                
+            
                 Vector3 direction = target - car.transform.position;
                 if (direction != Vector3.zero) {
                     float angle = Mathf.Atan2(direction.y, direction.x) * Mathf.Rad2Deg;
@@ -230,7 +299,11 @@ public class GameController : MonoBehaviour
                 }
 
                 if (Vector3.Distance(car.transform.position, target) < 0.1f) {
+                    int prevIndex = car.currentWaypointIndex;
                     car.currentWaypointIndex = (car.currentWaypointIndex + 1) % loc.path.PointsCount;
+                    if (prevIndex == loc.path.PointsCount - 1 && car.currentWaypointIndex == 0) {
+                        AddLaps(1);
+                    }
                 }
             }
         }
@@ -242,6 +315,7 @@ public class GameController : MonoBehaviour
 
             double income = 0;
             foreach (var loc in locations) {
+                if (!loc.isUnlocked) continue;
                 foreach (var car in loc.carsInLocation) {
                     income += tiers[car.tierIndex].income;
                 }
@@ -266,6 +340,32 @@ public class GameController : MonoBehaviour
             currentLocIndex = index;
             Debug.Log($"Теперь покупаем машины для: {locations[index].locationName}");
         }
+    }
+    public void UnlockLocation(int locIndex) {
+        if (locIndex < 0 || locIndex >= locations.Length) return;
+        var loc = locations[locIndex];
+    
+        if (loc.isUnlocked) {
+            Debug.Log("Уже открыта!");
+            return;
+        }
+    
+        if (totalLaps < loc.unlockLapCost) {
+            Debug.Log($"Недостаточно кругов! Нужно {loc.unlockLapCost}, есть {totalLaps}");
+            return;
+        }
+    
+        totalLaps -= loc.unlockLapCost;
+        loc.isUnlocked = true;
+        UpdateLaps(0); // обновить UI без изменения суммы
+        ApplyUnlockVisuals(locIndex);
+        Debug.Log($"Локация {loc.locationName} открыта!");
+    }
+
+    private void ApplyUnlockVisuals(int locIndex) {
+        var loc = locations[locIndex];
+        if (loc.unlockButton != null) loc.unlockButton.SetActive(false);
+        if (loc.lockedOverlay != null) loc.lockedOverlay.SetActive(false);
     }
 
     void OnDestroy() => _cts?.Cancel();
